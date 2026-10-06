@@ -1258,6 +1258,18 @@ impl App {
             return actions;
         }
 
+        for (binding, forward, users_only) in [
+            (key::NEXT_MESSAGE, true, false),
+            (key::PREV_MESSAGE, false, false),
+            (key::NEXT_USER_PROMPT, true, true),
+            (key::PREV_USER_PROMPT, false, true),
+        ] {
+            if binding.matches(key) {
+                self.active_chat().jump_message(forward, users_only);
+                return vec![];
+            }
+        }
+
         if key::SCROLL_PAGE_UP.matches(key) {
             let page = self.chats[self.active_chat].page();
             self.active_chat().scroll(page);

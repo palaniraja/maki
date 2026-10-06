@@ -2654,6 +2654,278 @@ fn winsaveview_round_trips_through_winrestview() {
     assert_eq!(panel.scroll_pos(), pos);
 }
 
+#[test_case(false ; "all_messages")]
+#[test_case(true ; "user_prompts")]
+fn jump_message_wraps_when_enabled(users_only: bool) {
+    const MESSAGE_LINES: usize = 20;
+    const VIEWPORT_HEIGHT: u16 = 5;
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            navigation_wrap: true,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    for role in [DisplayRole::User, DisplayRole::Assistant, DisplayRole::User] {
+        panel.push(DisplayMessage::new(role, "line\n".repeat(MESSAGE_LINES)));
+    }
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    panel.scroll_to_top();
+    let first = panel.scroll_pos();
+    panel.jump_message(false, users_only);
+    let last = panel.scroll_pos();
+    assert!(last > first);
+    assert!(!panel.jump_highlight.as_ref().unwrap().at_boundary);
+    panel.jump_message(true, users_only);
+    assert_eq!(panel.scroll_pos(), first);
+    assert!(!panel.jump_highlight.as_ref().unwrap().at_boundary);
+    panel.jump_message(true, users_only);
+    if users_only {
+        assert_eq!(panel.scroll_pos(), last);
+    } else {
+        assert!(panel.scroll_pos() > first);
+        assert!(panel.scroll_pos() < last);
+    }
+}
+
+#[test_case(false ; "all_messages")]
+#[test_case(true ; "user_prompts")]
+fn jump_message_skips_non_conversation_segments(users_only: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for role in [
+        DisplayRole::User,
+        DisplayRole::Thinking,
+        DisplayRole::Assistant,
+        DisplayRole::Notice,
+        DisplayRole::User,
+        DisplayRole::Assistant,
+    ] {
+        panel.push(DisplayMessage::new(role, "line\n".repeat(20)));
+    }
+    render(&mut panel, VIEW_WIDTH, 5);
+    let targets: Vec<_> = panel
+        .cache
+        .segments()
+        .iter()
+        .enumerate()
+        .filter_map(|(seg, cached)| {
+            let msg = panel.messages.get(cached.msg_index?)?;
+            (matches!(msg.role, DisplayRole::User)
+                || (!users_only && matches!(msg.role, DisplayRole::Assistant)))
+            .then_some(ScrollPos { seg, row: 0 })
+        })
+        .collect();
+    panel.scroll_to_top();
+    panel.jump_message(false, users_only);
+    assert_eq!(panel.scroll_pos(), targets[0]);
+    for &target in &targets[1..] {
+        panel.jump_message(true, users_only);
+        render(&mut panel, VIEW_WIDTH, 5);
+        assert_eq!(panel.scroll_pos(), target);
+        assert!(!panel.auto_scroll());
+    }
+    panel.jump_message(true, users_only);
+    assert_eq!(panel.scroll_pos(), *targets.last().unwrap());
+    for &target in targets[..targets.len() - 1].iter().rev() {
+        panel.jump_message(false, users_only);
+        assert_eq!(panel.scroll_pos(), target);
+    }
+    panel.scroll_to(ScrollPos {
+        seg: targets[1].seg,
+        row: 3,
+    });
+    panel.jump_message(false, users_only);
+    assert_eq!(panel.scroll_pos(), targets[1]);
+    panel.enable_auto_scroll();
+    panel.jump_message(false, users_only);
+    assert_eq!(panel.scroll_pos(), *targets.last().unwrap());
+}
+
+#[test]
+fn jump_message_includes_streaming_assistant_text() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, "line\n".repeat(20)));
+    panel.streaming_text.set_buffer(&"response\n".repeat(20));
+    render(&mut panel, VIEW_WIDTH, 5);
+    panel.scroll_to_top();
+    panel.jump_message(true, true);
+    assert_eq!(panel.scroll_pos(), ScrollPos::default());
+    panel.jump_message(true, false);
+    let target = panel.scroll_pos();
+    assert_eq!(panel.tail[target.seg - panel.cache.len()].0, TailPart::Text);
+    assert_eq!(target.row, 0);
+    render(&mut panel, VIEW_WIDTH, 5);
+    assert_eq!(panel.scroll_pos(), target);
+}
+
+#[test_case(false, false ; "cached")]
+#[test_case(true, false ; "streaming")]
+#[test_case(false, true ; "cached_near_bottom")]
+#[test_case(true, true ; "streaming_near_bottom")]
+fn jump_message_highlights_destination_until_expiry(streaming: bool, short: bool) {
+    const RESPONSE: &str = "response\n";
+    const VIEWPORT_HEIGHT: u16 = 5;
+    const LONG_MESSAGE_LINES: usize = 20;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        RESPONSE.repeat(LONG_MESSAGE_LINES),
+    ));
+    let response = RESPONSE.repeat(if short { 1 } else { LONG_MESSAGE_LINES });
+    if streaming {
+        panel.streaming_text.set_buffer(&response);
+    } else {
+        panel.push(DisplayMessage::new(DisplayRole::Assistant, response));
+    }
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    panel.scroll_to_top();
+    panel.jump_message(true, false);
+    let highlighted = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    let target = panel.jump_highlight.as_ref().unwrap().target;
+    if short {
+        assert!(target > panel.scroll_pos());
+    }
+    let RowPos::At(row) = panel.project_row(DocPos {
+        seg: target.seg,
+        row: target.row,
+        col: 0,
+    }) else {
+        panic!("destination must be visible");
+    };
+    panel.jump_highlight.as_mut().unwrap().started = Instant::now() - JUMP_HIGHLIGHT_DURATION;
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    assert!(panel.jump_highlight.is_none());
+    let baseline = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    for y in 0..VIEWPORT_HEIGHT {
+        for x in 0..VIEW_WIDTH - 1 {
+            let mut expected = baseline.backend().buffer()[(x, y)].clone();
+            if y == row {
+                expected.set_style(theme::current().item_selected);
+            }
+            assert_eq!(highlighted.backend().buffer()[(x, y)], expected);
+        }
+    }
+    panel.scroll_to_top();
+    panel.jump_message(true, false);
+    assert!(panel.jump_highlight.is_some());
+    panel.jump_message(true, false);
+    let highlight = panel.jump_highlight.as_ref().unwrap();
+    assert!(highlight.at_boundary);
+    assert_eq!(highlight.target, target);
+    panel.scroll(1);
+    assert!(panel.jump_highlight.is_none());
+}
+
+#[test_case(false, false ; "previous_message")]
+#[test_case(true, false ; "next_message")]
+#[test_case(false, true ; "previous_prompt")]
+#[test_case(true, true ; "next_prompt")]
+fn jump_message_flashes_error_at_boundary(forward: bool, users_only: bool) {
+    const MESSAGE_LINES: usize = 20;
+    const VIEWPORT_HEIGHT: u16 = 5;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "line\n".repeat(MESSAGE_LINES),
+    ));
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    if !forward {
+        panel.scroll_to_top();
+    }
+    let position = panel.scroll_pos();
+    let auto_scroll = panel.auto_scroll();
+    let baseline = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    panel.jump_message(forward, users_only);
+    let highlight = panel.jump_highlight.as_ref().unwrap();
+    assert!(highlight.at_boundary);
+    assert_eq!(highlight.target, ScrollPos::default());
+    assert_eq!(panel.scroll_pos(), position);
+    assert_eq!(panel.auto_scroll(), auto_scroll);
+    let highlighted = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    for y in 0..VIEWPORT_HEIGHT {
+        for x in 0..VIEW_WIDTH - 1 {
+            let mut expected = baseline.backend().buffer()[(x, y)].clone();
+            if y == 0 {
+                expected.set_style(Style::new().bg(theme::current().error.fg.unwrap()));
+            }
+            assert_eq!(highlighted.backend().buffer()[(x, y)], expected);
+        }
+    }
+    panel.jump_highlight.as_mut().unwrap().started = Instant::now() - JUMP_HIGHLIGHT_DURATION;
+    panel.jump_message(forward, users_only);
+    assert_eq!(panel.tick(), Dirty::NO, "{QUIET}");
+    panel.jump_highlight.as_mut().unwrap().started = Instant::now() - JUMP_HIGHLIGHT_DURATION;
+    assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+    assert!(panel.jump_highlight.is_none());
+    let restored = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    assert_eq!(restored.backend().buffer(), baseline.backend().buffer());
+}
+
+#[test_case(false, false ; "message_at_bottom")]
+#[test_case(true, false ; "prompt_at_bottom")]
+#[test_case(false, true ; "message_after_flash_expires")]
+#[test_case(true, true ; "prompt_after_flash_expires")]
+fn jump_message_boundary_highlights_bottom_prompt(users_only: bool, expire: bool) {
+    const PROMPT: &str = "last prompt";
+    const VIEWPORT_HEIGHT: u16 = 5;
+    const MESSAGE_LINES: usize = 20;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        "response\n".repeat(MESSAGE_LINES),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::User, PROMPT.into()));
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    panel.scroll_to_top();
+    panel.jump_message(true, users_only);
+    render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    let target = panel.jump_highlight.as_ref().unwrap().target;
+    let position = panel.scroll_pos();
+    if expire {
+        panel.jump_highlight.as_mut().unwrap().started = Instant::now() - JUMP_HIGHLIGHT_DURATION;
+        assert_eq!(panel.tick(), Dirty::YES, "{OWED}");
+        assert!(panel.jump_highlight.is_none());
+    }
+    panel.jump_message(true, users_only);
+    let highlight = panel.jump_highlight.as_ref().unwrap();
+    assert!(highlight.at_boundary);
+    assert_eq!(highlight.target, target);
+    assert_eq!(panel.scroll_pos(), position);
+    let highlighted = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    let RowPos::At(row) = panel.project_row(DocPos {
+        seg: target.seg,
+        row: target.row,
+        col: 0,
+    }) else {
+        panic!("prompt must be visible");
+    };
+    assert!(row > 0);
+    panel.jump_highlight = None;
+    let baseline = render(&mut panel, VIEW_WIDTH, VIEWPORT_HEIGHT);
+    for y in 0..VIEWPORT_HEIGHT {
+        for x in 0..VIEW_WIDTH - 1 {
+            let actual = &highlighted.backend().buffer()[(x, y)];
+            let original = &baseline.backend().buffer()[(x, y)];
+            assert_eq!(actual.fg, original.fg);
+            if y == row {
+                assert_eq!(actual.bg, theme::current().error.fg.unwrap());
+            } else {
+                assert_eq!(actual, original);
+            }
+        }
+    }
+}
+
+#[test]
+fn jump_message_on_empty_transcript_is_a_noop() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.jump_message(true, false);
+    panel.jump_message(false, true);
+    assert_eq!(panel.scroll_pos(), ScrollPos::default());
+    assert!(panel.auto_scroll());
+    assert!(panel.jump_highlight.is_none());
+}
+
 const THEME_CODE: &str = "fn main() { let x = 1; }";
 const THEME_CODE_KEYWORDS: [&str; 3] = ["fn", "main", "let"];
 

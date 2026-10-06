@@ -2224,6 +2224,36 @@ fn page_keys_scroll_the_transcript_by_one_page() {
     );
 }
 
+#[test_case(kb::NEXT_MESSAGE, 2 ; "next_message")]
+#[test_case(kb::PREV_MESSAGE, 4 ; "previous_message")]
+#[test_case(kb::NEXT_USER_PROMPT, 4 ; "next_user_prompt")]
+#[test_case(kb::PREV_USER_PROMPT, 4 ; "previous_user_prompt")]
+fn message_navigation_shortcuts_preserve_the_draft(
+    binding: crate::components::keybindings::Bind,
+    expected_seg: usize,
+) {
+    let mut app = test_app();
+    for role in [
+        DisplayRole::User,
+        DisplayRole::Assistant,
+        DisplayRole::User,
+        DisplayRole::Assistant,
+    ] {
+        app.active_chat()
+            .push(DisplayMessage::new(role, "line\n".repeat(30)));
+    }
+    rendered(&mut app);
+    app.input_box.set_input("unfinished draft".into());
+    if binding == kb::NEXT_MESSAGE || binding == kb::NEXT_USER_PROMPT {
+        app.active_chat().scroll_to_top();
+    } else {
+        app.active_chat().scroll_to_segment(6);
+    }
+    app.update(Msg::Key(binding.to_key_event()));
+    assert_eq!(app.active_chat().scroll_pos().seg, expected_seg);
+    assert_eq!(app.input_box.draft_text(), "unfinished draft");
+}
+
 const COMPACT_GUIDANCE: &str = "keep the failing test names";
 const COMPACT_WITH_GUIDANCE: &str = "/compact keep the failing test names";
 

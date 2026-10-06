@@ -283,6 +283,10 @@ impl Chat {
         self.messages_panel.scroll(delta);
     }
 
+    pub fn jump_message(&mut self, forward: bool, users_only: bool) {
+        self.messages_panel.jump_message(forward, users_only);
+    }
+
     pub fn scroll_to_row(&mut self, doc_row: u32) {
         self.messages_panel.scroll_to_row(doc_row);
     }

@@ -647,6 +647,7 @@ pub struct UiFileConfig {
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
+    pub navigation_wrap: Option<bool>,
     pub show_thinking: Option<bool>,
     pub theme: Option<String>,
     pub clock_format: Option<ClockFormat>,
@@ -666,6 +667,7 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
+            navigation_wrap,
             show_thinking,
             theme,
             clock_format,
@@ -1253,6 +1255,12 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(
+        default = false,
+        desc = "Wrap message and user-prompt navigation at transcript boundaries"
+    )]
+    pub navigation_wrap: bool,
+
     #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
     pub max_input_lines: u32,
 
@@ -1288,6 +1296,7 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            navigation_wrap: f.navigation_wrap.unwrap_or(false),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
@@ -2864,6 +2873,7 @@ mod tests {
     fn empty_config_returns_defaults() {
         let config = RawConfig::default().into_config(&[]).unwrap();
         assert!(config.ui.splash_animation);
+        assert!(!config.ui.navigation_wrap);
         assert_eq!(config.ui.notifications, NotificationMethod::Auto);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(
