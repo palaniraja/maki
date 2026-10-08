@@ -3532,7 +3532,7 @@ fn setup_all_sections_at_once() {
                 always_yolo = true,
                 always_fast = true,
                 always_thinking = "adaptive",
-                ui = { splash_animation = false, mouse_scroll_lines = 5, navigation_wrap = true },
+                ui = { splash_animation = false, mouse_scroll_lines = 5 },
                 agent = {
                     max_output_lines = 9000,
                     compaction_instructions = "Note plan.md",
@@ -3556,7 +3556,6 @@ fn setup_all_sections_at_once() {
     );
     assert_eq!(raw.ui.splash_animation, Some(false));
     assert_eq!(raw.ui.mouse_scroll_lines, Some(5));
-    assert_eq!(raw.ui.navigation_wrap, Some(true));
     assert_eq!(raw.agent.max_output_lines, Some(9000));
     assert_eq!(
         raw.agent.compaction_instructions.as_deref(),

@@ -35,7 +35,7 @@ use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::scrollbar::{self, render_vertical_scrollbar};
 use super::streaming_content::StreamingContent;
@@ -55,7 +55,6 @@ use ratatui::text::{Line, Span};
 use tracing::warn;
 
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
-const JUMP_HIGHLIGHT_DURATION: Duration = Duration::from_millis(300);
 /// How far outside the drawn range an image keeps its encoded protocol.
 const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
 
@@ -64,12 +63,6 @@ pub struct PromptProgress {
     pub processed: u32,
     pub total: u32,
     pub cache: u32,
-}
-
-struct JumpHighlight {
-    target: ScrollPos,
-    started: Instant,
-    at_boundary: bool,
 }
 
 pub struct MessagesPanel {
@@ -91,8 +84,6 @@ pub struct MessagesPanel {
     image_generation: u64,
     theme_generation: u64,
     highlight_segment: Option<usize>,
-    jump_highlight: Option<JumpHighlight>,
-    navigation_wrap: bool,
     idle_splash: Splash,
     accent: ColorTransition,
     expanded_tools: HashMap<String, SectionFlags>,
@@ -152,8 +143,6 @@ impl MessagesPanel {
             image_generation: terminal_image::generation(),
             theme_generation: theme::generation(),
             highlight_segment: None,
-            jump_highlight: None,
-            navigation_wrap: ui_config.navigation_wrap,
             idle_splash: Splash::new(ui_config.splash_animation),
             accent: ColorTransition::new(theme::current().mode_build),
             expanded_tools: HashMap::new(),
@@ -238,7 +227,6 @@ impl MessagesPanel {
         self.watched_bufs.clear();
         self.rebake_requested.clear();
         self.highlight_segment = None;
-        self.jump_highlight = None;
         self.thinking_collapsed = !self.show_thinking;
     }
 
@@ -639,7 +627,6 @@ impl MessagesPanel {
     /// Always unpins, and the next `view` re-pins if this lands on the
     /// bottom line.
     fn scroll_to(&mut self, pos: ScrollPos) {
-        self.jump_highlight = None;
         self.scroll = pos;
         self.auto_scroll = false;
     }
@@ -653,13 +640,13 @@ impl MessagesPanel {
     }
 
     pub fn enable_auto_scroll(&mut self) {
-        self.jump_highlight = None;
         self.auto_scroll = true;
     }
 
-    pub fn jump_message(&mut self, forward: bool, users_only: bool) {
+    pub fn transcript_positions(&mut self) -> serde_json::Value {
         self.rebuild_line_cache();
-        let bottom = self.layout().bottom(self.viewport_height);
+        let layout = self.layout();
+        let bottom = layout.bottom(self.viewport_height);
         let current = if self.auto_scroll {
             bottom
         } else {
@@ -671,69 +658,34 @@ impl MessagesPanel {
             .iter()
             .enumerate()
             .filter_map(|(seg, cached)| {
-                let msg = self.messages.get(cached.msg_index?)?;
-                (matches!(msg.role, DisplayRole::User)
-                    || (!users_only && matches!(msg.role, DisplayRole::Assistant)))
-                .then_some(ScrollPos { seg, row: 0 })
+                let role = match self.messages.get(cached.msg_index?)?.role {
+                    DisplayRole::User => "user",
+                    DisplayRole::Assistant => "assistant",
+                    _ => return None,
+                };
+                Some((seg, role))
             });
         let streaming = self
             .tail
             .iter()
             .enumerate()
             .filter_map(|(index, (part, _))| {
-                (!users_only && *part == TailPart::Text).then_some(ScrollPos {
-                    seg: self.cache.len() + index,
-                    row: 0,
+                (*part == TailPart::Text).then_some((self.cache.len() + index, "assistant"))
+            });
+        let positions: Vec<_> = messages
+            .chain(streaming)
+            .map(|(seg, role)| {
+                let landing = ScrollPos { seg, row: 0 }.min(bottom);
+                serde_json::json!({
+                    "role": role,
+                    "topline": u64::from(layout.doc_row(landing)) + 1,
                 })
-            });
-        let targets = messages.chain(streaming);
-        let boundary = if forward {
-            targets.clone().last()
-        } else {
-            targets.clone().next()
-        };
-        let wrap_target = if self.navigation_wrap {
-            if forward {
-                targets.clone().next()
-            } else {
-                targets.clone().last()
-            }
-        } else {
-            None
-        };
-        let mut targets = targets
-            .map(|pos| (pos, pos.min(bottom)))
-            .filter(|(_, landing)| {
-                if forward {
-                    *landing > current
-                } else {
-                    *landing < current
-                }
-            });
-        let target = if forward {
-            targets.next()
-        } else {
-            targets.last()
-        };
-        let target = target.or_else(|| {
-            wrap_target
-                .map(|pos| (pos, pos.min(bottom)))
-                .filter(|(_, landing)| *landing != current)
-        });
-        if let Some((target, landing)) = target {
-            self.scroll_to(landing);
-            self.jump_highlight = Some(JumpHighlight {
-                target,
-                started: Instant::now(),
-                at_boundary: false,
-            });
-        } else if let Some(target) = boundary {
-            self.jump_highlight = Some(JumpHighlight {
-                target,
-                started: Instant::now(),
-                at_boundary: true,
-            });
-        }
+            })
+            .collect();
+        serde_json::json!({
+            "topline": u64::from(layout.doc_row(current)) + 1,
+            "positions": positions,
+        })
     }
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
@@ -750,7 +702,6 @@ impl MessagesPanel {
     }
 
     pub fn restore_scroll(&mut self, scroll: ScrollPos, auto_scroll: bool) {
-        self.jump_highlight = None;
         self.scroll = scroll;
         self.auto_scroll = auto_scroll;
     }
@@ -883,14 +834,6 @@ impl MessagesPanel {
     /// them fed.
     pub fn tick(&mut self) -> Dirty {
         let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
-        if self
-            .jump_highlight
-            .as_ref()
-            .is_some_and(|highlight| highlight.started.elapsed() >= JUMP_HIGHLIGHT_DURATION)
-        {
-            self.jump_highlight = None;
-            dirty |= Dirty::YES;
-        }
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -910,7 +853,6 @@ impl MessagesPanel {
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
             Cadence::when(smooth, Cadence::SMOOTH),
-            Cadence::when(self.jump_highlight.is_some(), Cadence::PENDING),
             Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
         ])
     }
@@ -1065,30 +1007,6 @@ impl MessagesPanel {
                 TailPart::Text => self.streaming_text.cached_lines(),
             };
             cursor.render(lines, h, None, false, frame);
-        }
-
-        if let Some(highlight) = &self.jump_highlight {
-            let row = match self.project_row(DocPos {
-                seg: highlight.target.seg,
-                row: highlight.target.row,
-                col: 0,
-            }) {
-                RowPos::At(row) => Some(row),
-                RowPos::Above if highlight.at_boundary => Some(0),
-                _ => None,
-            };
-            if let Some(row) = row {
-                let theme = theme::current();
-                let style = if highlight.at_boundary {
-                    Style::new().bg(theme.error.fg.unwrap_or(Color::Reset))
-                } else {
-                    theme.item_selected
-                };
-                frame.buffer_mut().set_style(
-                    Rect::new(viewport.x, viewport.y + row, viewport.width, 1),
-                    style,
-                );
-            }
         }
 
         if let Some(pp) = self.prompt_progress

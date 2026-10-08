@@ -653,6 +653,9 @@ pub enum UiAction {
         req: TaskRequest,
         reply_tx: flume::Sender<UiReply>,
     },
+    TranscriptPositions {
+        reply_tx: flume::Sender<UiReply>,
+    },
     WinSaveView {
         reply_tx: flume::Sender<WinView>,
     },

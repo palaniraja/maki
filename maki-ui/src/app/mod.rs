@@ -827,6 +827,10 @@ impl App {
         self.chats[self.active_chat].win_view()
     }
 
+    pub(crate) fn transcript_positions(&mut self) -> serde_json::Value {
+        self.active_chat().transcript_positions()
+    }
+
     pub(crate) fn scroll_to_row(&mut self, doc_row: u32) {
         self.active_chat().scroll_to_row(doc_row);
     }
@@ -1257,18 +1261,6 @@ impl App {
 
         if let Some(actions) = self.handle_ctrl(key) {
             return actions;
-        }
-
-        for (binding, forward, users_only) in [
-            (key::NEXT_MESSAGE, true, false),
-            (key::PREV_MESSAGE, false, false),
-            (key::NEXT_USER_PROMPT, true, true),
-            (key::PREV_USER_PROMPT, false, true),
-        ] {
-            if binding.matches(key) {
-                self.active_chat().jump_message(forward, users_only);
-                return vec![];
-            }
         }
 
         if key::SCROLL_PAGE_UP.matches(key) {

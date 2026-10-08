@@ -158,26 +158,6 @@ pub mod key {
     pub const KILL_LINE: Bind = ctrl_bind!('k');
     pub const LINE_START: Bind = ctrl_bind!('a');
     pub const LINE_END: Bind = ctrl_bind!('e');
-    pub const NEXT_MESSAGE: Bind = Bind {
-        code: KeyCode::Char('j'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+J",
-    };
-    pub const PREV_MESSAGE: Bind = Bind {
-        code: KeyCode::Char('k'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+K",
-    };
-    pub const NEXT_USER_PROMPT: Bind = Bind {
-        code: KeyCode::Char('n'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+N",
-    };
-    pub const PREV_USER_PROMPT: Bind = Bind {
-        code: KeyCode::Char('p'),
-        modifiers: KeyModifiers::ALT,
-        label: "Alt+P",
-    };
     pub const EDIT_INPUT: Bind = Bind {
         code: KeyCode::Char('o'),
         modifiers: KeyModifiers::ALT,
@@ -328,18 +308,6 @@ pub struct Keybind {
 }
 
 pub const KEYBINDS: &[Keybind] = &[
-    Keybind {
-        label: KeyLabel::Alt(key::PREV_MESSAGE.label, key::NEXT_MESSAGE.label),
-        description: "Jump to previous / next message",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
-    Keybind {
-        label: KeyLabel::Alt(key::PREV_USER_PROMPT.label, key::NEXT_USER_PROMPT.label),
-        description: "Jump to previous / next user prompt",
-        context: KeybindContext::General,
-        platform: Platform::All,
-    },
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
         description: "Quit / clear input",
