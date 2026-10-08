@@ -1,5 +1,7 @@
 local Navigation = require("navigation")
 
+local HIGHLIGHT_DURATION_MS = 180
+
 local opts = maki.api.register_options({
   wrap = { default = false, desc = "Wrap message navigation at transcript boundaries" },
 })
@@ -19,13 +21,16 @@ for _, keys in ipairs({
     end
     local target, boundary = Navigation.target(view, binding[2], binding[3], opts.wrap)
     if target then
-      if boundary then
-        maki.ui.flash("Transcript boundary")
-        return
+      if not boundary then
+        local ok, scroll_err = maki.fn.winrestview({ topline = target.topline })
+        if not ok then
+          maki.notify(scroll_err, "error")
+          return
+        end
       end
-      local ok, focus_err = maki.fn.winrestview({ topline = target.topline })
+      local ok, highlight_err = maki.ui.highlight_transcript(target.line, HIGHLIGHT_DURATION_MS, boundary)
       if not ok then
-        maki.notify(focus_err, "error")
+        maki.notify(highlight_err, "error")
       end
     end
   end, { desc = binding[4] })

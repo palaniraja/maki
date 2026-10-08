@@ -1004,6 +1004,14 @@ impl<'t> EventLoop<'t> {
             UiAction::Plan { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_plan_request(req));
             }
+            UiAction::HighlightTranscript {
+                row,
+                error,
+                duration,
+            } => {
+                self.focused_app()
+                    .highlight_transcript(row, error, duration);
+            }
             UiAction::TranscriptPositions { reply_tx } => {
                 let _ = reply_tx.send(Ok(self.focused_app().transcript_positions()));
             }
