@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
+use maki_storage::id::MakiId;
+use maki_storage::sessions::StoredTokenUsage;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
@@ -677,6 +679,14 @@ pub enum UiAction {
         cmdline: String,
         depth: u8,
         reply_tx: flume::Sender<Result<(), String>>,
+    },
+    /// What one background subagent turn spent. A tab keeps its channels
+    /// across `/new`, so the chat session id is the only way to tell if the
+    /// tab still shows the session that paid.
+    BackgroundUsage {
+        session: MakiId,
+        model: String,
+        usage: StoredTokenUsage,
     },
 }
 

@@ -19,7 +19,8 @@ use crate::tools::{
     truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, CallRecord, TextOutput, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -397,6 +398,10 @@ struct Resolved<'a> {
 /// Precedence, highest first: client (ACP) tools, the registry, then MCP.
 /// The context is the only input, because resolving against one session and
 /// executing against another is how a tool escapes its audience.
+///
+/// A registry name the request's filter left out goes nowhere, and does not
+/// fall through to MCP either: a model told to call `bash` by a prompt that
+/// never published it must get nothing back.
 fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     // Names coming back from model JSON (batch children, `call_tool`, the
     // interpreter bridge) never passed through streaming.rs, so clean up here.
@@ -404,7 +409,11 @@ fn resolve<'a>(ctx: &'a ToolContext, name: &'a str) -> Resolved<'a> {
     let route = if let Some(local) = ctx.local_tools.get(name) {
         Route::Local(local)
     } else if let Some(entry) = ctx.registry.get(name) {
-        Route::Native(entry)
+        if ctx.tool_filter.matches(name) {
+            Route::Native(entry)
+        } else {
+            Route::Unknown
+        }
     } else if let Some(mcp) = ctx.mcp.as_ref() {
         match mcp.resolve(name) {
             Some(qualified) => Route::Mcp(mcp, qualified),
@@ -630,6 +639,18 @@ async fn run_native_tool(
     let mutated = invocation.mutable_path().map(FileKey::new);
 
     if let Some(key) = &mutated {
+        if let Some(chat) = ctx.background_for
+            && let Some(reason) = AgentSeed::background_write_block(chat)
+        {
+            warn!(
+                tool = %name,
+                %chat,
+                target = %key.as_path().display(),
+                reason = %reason,
+                "blocked background write"
+            );
+            return done_error(reason);
+        }
         let is_plan_target = ctx
             .mode
             .plan_path()
@@ -857,6 +878,7 @@ async fn gate(
     let decision = ctx.permissions.enforce(
         tool,
         scopes,
+        ctx.session_id.as_ref(),
         &ctx.event_tx,
         ctx.user_response_rx.as_deref(),
         id,
@@ -1092,11 +1114,13 @@ mod tests {
     use maki_config::{
         Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
     };
+    use maki_storage::id::MakiId;
     use smol::lock::Mutex as AsyncMutex;
     use test_case::test_case;
 
     use super::*;
     use crate::cancel::CancelToken;
+    use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
     use crate::permissions::{
@@ -1107,12 +1131,12 @@ mod tests {
     use crate::tools::schema::{JsonPath, ToolInputErrorKind};
     use crate::tools::test_support::{
         GUARDED_TOOL_NAME, GuardedMock, mock_tool, mock_tool_with_schema, stub_ctx,
-        stub_ctx_with_permissions,
+        stub_ctx_with_permissions, stub_seed,
     };
     use crate::tools::{
         BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
         ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolHook, local_tool,
+        ToolExecResult, ToolFilter, ToolHook, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1816,6 +1840,45 @@ mod tests {
         });
     }
 
+    fn planning() -> AgentMode {
+        AgentMode::Plan(PathBuf::from(PLAN_PATH))
+    }
+
+    /// Background work runs in build mode, so this gate is the only place the
+    /// chat's plan mode reaches it. Even the plan file gets no pass, because
+    /// nobody asked a monitor to write the user's plan. A write from inside
+    /// batch or code_execution must not slip past it either.
+    #[test_case(planning(),       PLAN_PATH,         CallOrigin::Model,  BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "plan_file_while_the_chat_plans")]
+    #[test_case(planning(),       HOOK_ESCAPED_PATH, CallOrigin::Nested, BACKGROUND_PLAN_WRITE_DENIED.to_owned() ; "nested_write_while_the_chat_plans")]
+    #[test_case(AgentMode::Build, PLAN_PATH,         CallOrigin::Model,  ran(PLAN_PATH)                          ; "building_chat_follows_the_rules")]
+    fn background_write_follows_the_chat_mode(
+        chat_mode: AgentMode,
+        target: &str,
+        origin: CallOrigin,
+        expected: String,
+    ) {
+        smol::block_on(async {
+            let chat = MakiId::generate();
+            let mailbox = SessionMailbox::register(chat);
+            let seed = mailbox.publish_seed(stub_seed(chat));
+            seed.set_chat_settings(Default::default(), &chat_mode);
+            let mut ctx = build_ctx();
+            ctx.registry = registered(Arc::new(HookMock(None)));
+            ctx.background_for = Some(chat);
+
+            let done = run(
+                TEST_ID.into(),
+                HOOK_TOOL_NAME,
+                &call_input(target),
+                &ctx,
+                origin,
+            )
+            .await;
+
+            assert_eq!(done.output.as_text(), expected);
+        });
+    }
+
     /// A plugin keys its state on these, so a stage firing under another
     /// call's identity would write onto that other call.
     #[test]
@@ -2404,6 +2467,23 @@ mod tests {
 
         assert_eq!(tool_names(tools.definitions()), [OTHER_WIRE]);
         assert_eq!(callable_names(&ctx), [OTHER_WIRE]);
+    }
+
+    /// The filter gates dispatch, not only the list the sandbox sees, or a
+    /// plugin pricing a session by the array it hands over would pay for less
+    /// than the session reaches.
+    #[test]
+    fn dispatch_refuses_a_registry_name_the_filter_left_out() {
+        smol::block_on(async {
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.registry = registry_with(&[PROBE_WIRE, OTHER_WIRE]);
+            ctx.tool_filter = Arc::new(ToolFilter::Only(vec![OTHER_WIRE.to_owned()]));
+
+            let done = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+
+            assert!(done.is_error);
+            assert!(done.output.as_text().starts_with(UNKNOWN_TOOL_PREFIX));
+        });
     }
 
     /// A host that trims the array it publishes (a Lua caller passing `except`)

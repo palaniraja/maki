@@ -63,6 +63,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `net`: outbound network requests
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
+- `agent`: starting model turns: prompting a chat, or running its own sessions
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -76,6 +77,7 @@ fs_write = true
 net = true
 run = true
 env = true
+agent = true
 ```
 
 The rules:
@@ -422,7 +424,6 @@ only in compact mode.
     Must return a string or a table with any of these fields:
     - `llm_output` (`string`) Result text for the model or the calling code.
     - `is_error` (`boolean`) When true, the result is treated as an error.
-    - `content` (`string`) Alias for llm_output (legacy).
     - `body` (`BufHandle`) Rich rendered body shown in the UI.
     - `header` (`BufHandle`) One-line header shown before the body.
     - `format` (`string`) "plain" (default) or "markdown".
@@ -1206,6 +1207,56 @@ print(r.text)
 sess:close()
 ```
 
+A CI monitor for each chat session the user opens. It wakes the agent
+once when CI turns red and stays quiet until CI is green again. Each
+wake costs a full agent turn, and the model words the same failure
+differently every round, so comparing replies would wake it every time.
+`SessionFocusChanged` also fires after `/reload`, so the monitor comes
+back on its own.
+
+```lua
+local tasks, failing = {}, {}
+
+local function start(sid)
+  if tasks[sid] then return end
+  tasks[sid] = maki.async.spawn(function()
+    while true do
+      maki.async.sleep(5 * 60 * 1000)
+      -- Prompts are denied here, so this needs an allow rule like `gh run list *`.
+      local sess = maki.agent.session({
+        session = sid,
+        name = "ci-monitor",
+        system = "Run `gh run list -L 3`. Reply exactly OK if all runs passed, else a 3-line failure summary.",
+        tools = (maki.agent.tools({ session = sid, audience = "general_sub", only = { "bash" } })),
+      })
+      -- nil once the chat session is gone. SessionEnd below stops the loop.
+      if sess then
+        local r, err = sess:prompt("Check CI now.")
+        sess:close()
+        local text = not err and r.text:match("^%s*(.-)%s*$")
+        if text == "OK" or text == "OK." then
+          failing[sid] = nil
+        elseif text and text ~= "" and not failing[sid] then
+          failing[sid] = true
+          maki.session.notify("[ci-monitor] " .. text, { session = sid, wake = true })
+        end
+      end
+    end
+  end)
+end
+
+maki.api.create_autocmd("SessionFocusChanged", {
+  callback = function(ev) start(ev.data.session_id) end,
+})
+maki.api.create_autocmd("SessionEnd", {
+  callback = function(ev)
+    local sid = ev.data.session_id
+    if tasks[sid] then tasks[sid]:cancel() end
+    tasks[sid], failing[sid] = nil, nil
+  end,
+})
+```
+
 ---
 
 ### `maki.agent.resolve_model()` {#maki-agent-resolve_model}
@@ -1281,17 +1332,21 @@ if err then error(err) end
 ### `maki.agent.tools()` {#maki-agent-tools}
 
 ```lua
-maki.agent.tools({ctx}, {opts})
+maki.agent.tools({ctx}, {opts?})
 ```
 
 Get the list of tool definitions for a given audience. Pass the result
 straight into `maki.agent.session()` or use it to inspect what tools are
 available.
 
+Without a `ctx`, pass `session = id` in `opts` to get the tools a
+background session of that chat would have.
+
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
-- `{opts}` (`table`) Required fields:
+- `{ctx}` (`LuaCtx|table`) Agent context, or `opts` when called without one.
+- `{opts?}` (`table?`) Required with a ctx. Fields:
+  - `session` (`string`) only without a ctx: id of a live chat session.
   - `audience` (`string`) tool audience filter, e.g. `"general"`, `"subagent"`,
     `"general_sub"`.
 
@@ -1412,7 +1467,7 @@ print(out)
 ### `maki.agent.session()` {#maki-agent-session}
 
 ```lua
-maki.agent.session({ctx}, {opts})
+maki.agent.session({ctx}, {opts?})
 ```
 
 Create a new subagent session. The session inherits the parent model and
@@ -1422,10 +1477,55 @@ you can send messages to with `:prompt()`.
 This is the main way to spin up a sub-conversation with its own history
 and tool set.
 
+Without a `ctx`, `maki.agent.session({ session = id, ... })` opens a
+background session. It borrows the model, permissions and MCP of the live
+chat session `id` and is not tied to any turn. Call it and its `:prompt()`
+from a task: a `maki.async.spawn` task, an autocmd callback or a tool
+handler. This form needs the `agent` plugin permission.
+
+Nobody can answer its permission prompts, so a call that would prompt is
+denied and the subagent is told why. Your rules, "allow for this session"
+answers and YOLO still apply, so add allow rules for what it runs (see
+[Permissions](/docs/permissions/)). It always runs in build mode. While the
+chat is in plan mode its file-write tools are denied. Its thinking never
+goes above the chat's current setting.
+
+Since nothing can prompt, the plugin must itself hold what its tools
+reach. A tool that declares a permission, like `bash` with `run`, needs
+that one. A tool that declares none, or `mcp` on a chat with MCP servers,
+needs every permission except `agent`. The read-only tools (`read`,
+`grep`, `glob`) declare none today, so handing them over takes all of
+them. `local_tools` need nothing, they run as the plugin. The ctx form
+follows the same rule when its own session cannot prompt: a tool handler
+inside such a session, or `maki -p`.
+
+`scope` sets the lifetime. `"task"`, the default, ends the session with
+the task that opened it: an autocmd callback when it returns, a tool
+handler with its tool call, a `maki.async.spawn` task when it finishes.
+`"session"` outlives the task. Both end at `:close()`, when the chat
+session ends (`/new`, closing the tab) and when the plugin unloads
+(`/reload`). Turn ends, Esc and rewinds leave it alone. Esc on a tool
+call still cancels a prompt that the tool's handler is waiting on.
+
+A polling monitor opens one per round inside a `maki.async.spawn` loop.
+An event-driven one opens once with `scope = "session"`, keeps the handle
+and prompts it from autocmd callbacks.
+
+Its spend counts in the chat's totals after each turn, and `/tasks` lists
+it but cannot stop it yet. Setting `plugins.<name>.enabled = false` stops a
+plugin's monitors from the next `/reload`. Under `maki -p` and ACP there is
+no live chat session, so opening one fails with "session not live". The
+[maki.agent](#maki-agent) overview has a full monitor.
+
 **Parameters:**
 
-- `{ctx}` (`LuaCtx`) Agent context.
-- `{opts}` (`table`) Optional fields:
+- `{ctx}` (`LuaCtx|table`) Agent context, or `opts` when called without one.
+- `{opts?}` (`table?`) Required with a ctx. Optional fields:
+  - `session` (`string`) required without a ctx: id of the live chat session
+    that owns it. Returns `(nil, "session not live: <id>")` once that
+    session has ended.
+  - `scope` (`string?`) only without a ctx: `"task"` (default) or
+    `"session"`, see above.
   - `model_spec` (`string?`) model spec string to use instead of the parent model.
   - `system` (`string?`) system prompt. Defaults to empty.
   - `tools` (`table?`) tool definitions array (from `maki.agent.tools()`).
@@ -1464,6 +1564,42 @@ if err then error(err) end
 local result, prompt_err = sess:prompt("Summarize this file.")
 sess:close()
 if prompt_err then error(prompt_err) end
+```
+
+---
+
+### `maki.agent.list()` {#maki-agent-list}
+
+```lua
+maki.agent.list({opts})
+```
+
+List the sessions plugins opened on a chat session without a `ctx`, see
+[maki.agent.session](#maki-agent-session).
+
+Each entry has these fields:
+- `id` (`string`) Session id.
+- `session` (`string`) Chat session it belongs to.
+- `plugin` (`string`) Plugin that opened it.
+- `name` (`string`) Name given at open.
+- `status` (`string`) `"working"` during a `:prompt()`, otherwise `"idle"`.
+- `started_at` (`integer`) Unix seconds.
+- `cost` (`number?`) Dollars billed so far, updated after each turn. nil until
+  a priced turn ends.
+
+**Parameters:**
+
+- `{opts}` (`table`) Required fields:
+  - `session` (`string`) id of the chat session.
+
+**Returns:** (`table?`, `string?`) Array of entries, or `(nil, err)` on failure.
+
+**Example:**
+
+```lua
+for _, s in ipairs(maki.agent.list({ session = id })) do
+  print(s.plugin, s.name, s.status, os.time() - s.started_at)
+end
 ```
 
 
@@ -1527,6 +1663,9 @@ it more than once is safe.
 Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
+
+On a background session, `close` cancels a running prompt rather than
+waiting for it.
 
 
 ## maki.async {#maki-async}
@@ -4549,10 +4688,10 @@ Starts a new session in the current project.
 
 **Parameters:**
 
-- `{opts?}` (`table?`) Optional fields: prompt (string) first user message
-
-  to submit right away; focus (boolean) switch the UI to the new session.
-
+- `{opts?}` (`table?`) Optional fields:
+  - `prompt` (`string`) first user message to submit right away. Needs the
+    `agent` permission.
+  - `focus` (`boolean`) switch the UI to the new session.
 
 **Returns:** (`string|nil`, `string|nil`) New session id, or nil and an error.
 
@@ -4574,6 +4713,8 @@ Sends {text} as a regular user prompt to a live session. The text is
 never interpreted: slash commands, `exit`, and `!` shell prefixes are
 all sent to the model verbatim. If the session is currently streaming,
 the prompt is queued and picked up when the agent reaches it.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4607,7 +4748,8 @@ observation waits for the session's next agent run.
 - `{text}` (`string`) What to report. Must not be blank.
 - `{opts?}` (`table`) Options:
   - `session` (`string`) id of a live session.
-  - `wake` (`boolean`) start a TUI turn when it next becomes idle (default false).
+  - `wake` (`boolean`) start a TUI turn when it next becomes idle (default
+    false). Needs the `agent` permission.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 
