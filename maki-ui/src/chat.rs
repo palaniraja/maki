@@ -15,6 +15,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
@@ -59,6 +60,12 @@ pub enum ChatEventResult {
 
 pub struct Chat {
     pub name: String,
+    /// The plugin that opened this task with `maki.agent.session`. A tool task
+    /// has none: it lives for one turn of the main chat and is swept with it,
+    /// while a plugin task answers only to its plugin and to Esc in its tab.
+    pub(crate) plugin: Option<Arc<str>>,
+    /// A plugin task between prompts: its run ended, its session did not.
+    pub(crate) idle: bool,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -95,6 +102,8 @@ impl Chat {
         messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
+            plugin: None,
+            idle: false,
             cost: None,
             list_cost: None,
             context_size: 0,
@@ -123,7 +132,19 @@ impl Chat {
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
-        self.finish.map(|(outcome, _)| outcome).into()
+        match self.finish {
+            Some((outcome, _)) => outcome.into(),
+            None if self.idle => TaskStatus::Idle,
+            None => TaskStatus::Working,
+        }
+    }
+
+    /// A plugin task that still answers to its plugin. Its session lives in
+    /// the Lua host, so neither a rewind nor a reload of the chrome ends it.
+    pub(crate) fn is_live_plugin_task_of(&self, session: MakiId) -> bool {
+        self.plugin.is_some()
+            && !self.is_finished()
+            && self.messages_panel.session_id() == Some(session)
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -228,6 +249,9 @@ impl Chat {
                     format!("{prefix}\n\n{text}"),
                 ));
             }
+            AgentEvent::AllowedByPlugin { id, plugin } => self
+                .messages_panel
+                .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
             }
@@ -461,7 +485,7 @@ impl Chat {
     }
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.update_tool_model(tool_id, model);
+        self.messages_panel.annotate_tool(tool_id, model);
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
@@ -1016,6 +1040,30 @@ mod tests {
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
+    }
+
+    /// The call never opened a prompt, so the row is the only place the user
+    /// learns something let it through. A code_execution run marks its row
+    /// once per inner call, and the row needs to say it only once.
+    #[test]
+    fn a_call_a_plugin_allowed_is_marked_on_its_row_once() {
+        const PLUGIN: &str = "automode";
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "code_execution"), None);
+        for _ in 0..2 {
+            chat.handle_event(
+                AgentEvent::AllowedByPlugin {
+                    id: "t1".into(),
+                    plugin: PLUGIN.into(),
+                },
+                None,
+            );
+        }
+        let row = chat.message_at(0).expect("the tool row");
+        assert_eq!(
+            row.annotation.as_deref(),
+            Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
+        );
     }
 
     #[test]

@@ -184,6 +184,10 @@ impl MessagesPanel {
         self.task_id = task_id;
     }
 
+    pub(crate) fn session_id(&self) -> Option<MakiId> {
+        self.session_id.as_ref().map(SessionRef::id)
+    }
+
     fn stamp_chat(&self, item: &mut maki_lua::RestoreItem) {
         item.session_id = self.session_id.clone();
         item.task_id = self.task_id.clone();
@@ -368,8 +372,8 @@ impl MessagesPanel {
         self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
     }
 
-    pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
+    pub fn annotate_tool(&mut self, tool_id: &str, note: &str) {
+        self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, note));
     }
 
     pub fn tool_snapshot(
