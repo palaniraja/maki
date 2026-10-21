@@ -1,6 +1,7 @@
--- Every backend here is an MCP server that answers tools/call with a text
--- content block, so one SSE parser serves them all. What changes is the
--- endpoint, the tool name, the argument names, and how a key rides along.
+-- The MCP backends answer tools/call with a text content block, so one SSE
+-- parser serves them all; what changes is the endpoint, the tool name, the
+-- argument names, and how a key rides along. searxng is the exception: a
+-- plain GET /search?format=json, built and read in searxng.lua.
 
 local MAX_CODEPOINT = 0x10FFFF
 local SURROGATE_MIN, SURROGATE_MAX = 0xD800, 0xDFFF
@@ -84,5 +85,10 @@ return {
       }
     end,
     clean = clean_kagi,
+  },
+  searxng = {
+    label = "SearXNG",
+    transport = "get", -- plain GET /search?format=json, no MCP
+    env = "SEARXNG_BASE_URL",
   },
 }

@@ -3810,6 +3810,7 @@ fn websearch_config(provider: &str) -> PluginsConfig {
 #[test_case::test_case("exa", "Exa AI" ; "default_backend")]
 #[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
 #[test_case::test_case("kagi", "Kagi" ; "keyed_backend")]
+#[test_case::test_case("searxng", "SearXNG" ; "self_hosted_backend")]
 fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
     let (reg, _host) = builtins_host_with(&websearch_config(provider));
     let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
@@ -3835,6 +3836,37 @@ fn websearch_unknown_provider_fails_the_load() {
         .load_builtins(&websearch_config("altavista"))
         .expect_err("unknown provider should fail");
     assert!(err.to_string().contains("unknown provider"), "got: {err}");
+}
+
+/// time_range is a GET-backend-only parameter: the MCP backends drop unknown
+/// arguments silently, so advertising it there would only spend prompt tokens.
+#[test]
+fn websearch_time_range_is_searxng_only() {
+    let (reg, _host) = builtins_host_with(&websearch_config("searxng"));
+    let entry = reg.get("websearch").expect("websearch registered");
+    assert!(
+        entry.tool.schema()["properties"]
+            .get("time_range")
+            .is_some(),
+        "searxng must advertise time_range"
+    );
+    let err = match entry
+        .tool
+        .parse(&serde_json::json!({ "query": "x", "time_range": "decade" }))
+    {
+        Ok(_) => panic!("time_range outside the enum must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("time_range"), "got: {err}");
+
+    let (reg, _host) = builtins_host_with(&websearch_config("exa"));
+    let entry = reg.get("websearch").expect("websearch registered");
+    assert!(
+        entry.tool.schema()["properties"]
+            .get("time_range")
+            .is_none(),
+        "exa must not advertise time_range"
+    );
 }
 
 #[test_case::test_case(

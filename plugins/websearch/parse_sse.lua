@@ -1,4 +1,4 @@
-local NO_RESULTS_MSG = "No search results found"
+local NO_RESULTS_MSG = require("constants").NO_RESULTS_MSG
 local MCP_ERROR_PREFIX = "MCP error: "
 local MCP_TOOL_ERROR_PREFIX = "MCP tool error: "
 local UNKNOWN_ERROR_MSG = "unknown error"
