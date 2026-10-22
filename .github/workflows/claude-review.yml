@@ -25,6 +25,7 @@ jobs:
       EXTRA: ${{ github.event.comment.body }}
       REVIEW_PROMPT: ${{ vars.REVIEW_PROMPT }}
       REVIEW_MODEL: ${{ vars.REVIEW_MODEL || 'claude-opus-5-5' }}
+      REVIEW_EFFORT: ${{ vars.REVIEW_EFFORT || 'high' }}
       SCRATCH_DIR: /tmp/claude-review
     steps:
       - run: npm install -g @anthropic-ai/claude-code
@@ -65,6 +66,7 @@ jobs:
           claude -p "$prompt
           ${EXTRA#/review}" \
             --model "$REVIEW_MODEL" \
+            --effort "$REVIEW_EFFORT" \
             --add-dir "$SCRATCH_DIR" \
             --allowedTools "Read,Grep,Glob,Edit(/$SCRATCH_DIR/**),Write(/$SCRATCH_DIR/**),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*)" \
             --output-format stream-json --verbose \
