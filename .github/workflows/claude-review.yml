@@ -67,6 +67,7 @@ jobs:
           ${EXTRA#/review}" \
             --model "$REVIEW_MODEL" \
             --effort "$REVIEW_EFFORT" \
+            --settings '{"attribution":{"commit":"","pr":""},"includeCoAuthoredBy":false}' \
             --add-dir "$SCRATCH_DIR" \
             --allowedTools "Read,Grep,Glob,Edit(/$SCRATCH_DIR/**),Write(/$SCRATCH_DIR/**),Bash(git log:*),Bash(git show:*),Bash(git diff:*),Bash(git blame:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*)" \
             --output-format stream-json --verbose \
