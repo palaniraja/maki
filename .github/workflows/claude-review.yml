@@ -26,6 +26,8 @@ jobs:
       REVIEW_PROMPT: ${{ vars.REVIEW_PROMPT }}
       REVIEW_MODEL: ${{ vars.REVIEW_MODEL || 'claude-opus-5-5' }}
       REVIEW_EFFORT: ${{ vars.REVIEW_EFFORT || 'high' }}
+      REVIEW_MAX_PRS_PER_DAY: ${{ vars.REVIEW_MAX_PRS_PER_DAY || 10 }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
       SCRATCH_DIR: /tmp/claude-review
     steps:
       - run: >-
@@ -59,10 +61,17 @@ jobs:
             echo "::error::Set the REVIEW_PROMPT repository variable"
             exit 1
           fi
-          if [ "$GITHUB_EVENT_NAME" = pull_request ] &&
-            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --jq '.[].user.login' | grep -xF "$REVIEWER[bot]" >/dev/null; then
-            echo "Already reviewed, comment /review to review again"
-            exit 0
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --jq '.[].user.login' | grep -xF "$REVIEWER[bot]" >/dev/null; then
+              echo "Already reviewed, comment /review to review again"
+              exit 0
+            fi
+            since=$(date -u -d '24 hours ago' +%FT%TZ)
+            opened=$(gh api -X GET search/issues -f q="repo:$GITHUB_REPOSITORY is:pr author:$PR_AUTHOR created:>=$since" --jq .total_count)
+            if [ "$opened" -gt "$REVIEW_MAX_PRS_PER_DAY" ]; then
+              echo "::notice::$PR_AUTHOR opened $opened PRs in 24h (limit $REVIEW_MAX_PRS_PER_DAY), comment /review to review anyway"
+              exit 0
+            fi
           fi
           mkdir -p "$SCRATCH_DIR"
           prompt="${REVIEW_PROMPT//\$PR/$PR}"
