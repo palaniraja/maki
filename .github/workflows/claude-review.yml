@@ -53,6 +53,11 @@ jobs:
             echo "::error::Set the REVIEW_PROMPT repository variable"
             exit 1
           fi
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] &&
+            gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --jq '.[].user.login' | grep -xF "$REVIEWER[bot]" >/dev/null; then
+            echo "Already reviewed, comment /review to review again"
+            exit 0
+          fi
           mkdir -p "$SCRATCH_DIR"
           prompt="${REVIEW_PROMPT//\$PR/$PR}"
           prompt="${prompt//\$REPO/$GITHUB_REPOSITORY}"
