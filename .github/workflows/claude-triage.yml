@@ -3,19 +3,23 @@ name: Claude Triage
 on:
   issues:
     types: [opened]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to triage
+        required: true
+        type: number
 
 jobs:
   triage:
-    if: github.event.issue.labels[0] == null
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.labels[0] == null
     runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write
     env:
       GH_TOKEN: ${{ github.token }}
-      ISSUE: ${{ github.event.issue.number }}
-      TITLE: ${{ github.event.issue.title }}
-      BODY: ${{ github.event.issue.body }}
+      ISSUE: ${{ github.event.issue.number || inputs.issue }}
       TRIAGE_PROMPT: ${{ vars.TRIAGE_PROMPT }}
       TRIAGE_MODEL: ${{ vars.REVIEW_MODEL || 'claude-opus-5-5' }}
       TRIAGE_EFFORT: ${{ vars.REVIEW_EFFORT || 'high' }}
@@ -51,14 +55,15 @@ jobs:
             },
             required: ["kind", "duplicate_of", "comment"]
           }')
+          issue=$(gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json title,body \
+            --jq '"<title>\(.title)</title>\n<body>\(.body)</body>"')
           prompt="${TRIAGE_PROMPT//\$ISSUE/$ISSUE}"
           prompt="${prompt//\$REPO/$GITHUB_REPOSITORY}"
           prompt="${prompt//\$SHA/$(git rev-parse HEAD)}"
           prompt="${prompt//\$SEVERITIES/$(jq -r '.[] | "  - \(.name): \(.description)"' <<<"$severities")}"
           claude -p "$prompt
 
-          <title>$TITLE</title>
-          <body>$BODY</body>" \
+          $issue" \
             --model "$TRIAGE_MODEL" \
             --effort "$TRIAGE_EFFORT" \
             --settings '{"attribution":{"commit":"","pr":""},"includeCoAuthoredBy":false,"sandbox":{"network":{"allowedDomains":["github.com","api.github.com"]}}}' \
