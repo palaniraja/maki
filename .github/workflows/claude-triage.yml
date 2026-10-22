@@ -1,0 +1,88 @@
+name: Claude Triage
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    if: github.event.issue.labels[0] == null
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: ${{ github.event.issue.number }}
+      TITLE: ${{ github.event.issue.title }}
+      BODY: ${{ github.event.issue.body }}
+      TRIAGE_PROMPT: ${{ vars.TRIAGE_PROMPT }}
+      TRIAGE_MODEL: ${{ vars.REVIEW_MODEL || 'claude-opus-5-5' }}
+      TRIAGE_EFFORT: ${{ vars.REVIEW_EFFORT || 'high' }}
+      OUT: /tmp/claude-triage.jsonl
+    steps:
+      - run: >-
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
+          && sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0
+      - run: npm install -g @anthropic-ai/claude-code
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Triage
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: 1
+        run: |
+          if [ -z "$TRIAGE_PROMPT" ]; then
+            echo "::error::Set the TRIAGE_PROMPT repository variable"
+            exit 1
+          fi
+          severities=$(gh label list -R "$GITHUB_REPOSITORY" --search severity --json name,description \
+            --jq '[.[] | select(.name | startswith("severity: "))]')
+          schema=$(jq -nc --argjson sev "$severities" '{
+            type: "object",
+            properties: {
+              kind: {enum: ["bug", "enhancement"]},
+              severity: {enum: [$sev[].name]},
+              duplicate_of: {type: ["integer", "null"]},
+              comment: {type: "string"}
+            },
+            required: ["kind", "duplicate_of", "comment"]
+          }')
+          prompt="${TRIAGE_PROMPT//\$ISSUE/$ISSUE}"
+          prompt="${prompt//\$REPO/$GITHUB_REPOSITORY}"
+          prompt="${prompt//\$SHA/$(git rev-parse HEAD)}"
+          prompt="${prompt//\$SEVERITIES/$(jq -r '.[] | "  - \(.name): \(.description)"' <<<"$severities")}"
+          claude -p "$prompt
+
+          <title>$TITLE</title>
+          <body>$BODY</body>" \
+            --model "$TRIAGE_MODEL" \
+            --effort "$TRIAGE_EFFORT" \
+            --settings '{"attribution":{"commit":"","pr":""},"includeCoAuthoredBy":false,"sandbox":{"network":{"allowedDomains":["github.com","api.github.com"]}}}' \
+            --tools "Read,Grep,Glob,Bash" \
+            --allowedTools "Read(./**),Grep(./**),Glob(./**),Bash(git log:*),Bash(git show:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search issues:*)" \
+            --json-schema "$schema" \
+            --output-format stream-json --verbose \
+            | tee "$OUT" \
+            | jq -j --unbuffered '
+              if .type == "assistant" then .message.content[]
+                | if .type == "text" then .text + "\n"
+                  elif .type == "tool_use" then "> \(.name) \(.input | tostring | .[0:300])\n"
+                  else empty end
+              elif .type == "result" then
+                "\n== \(.subtype) turns=\(.num_turns) cost=$\(.total_cost_usd)\n\(.structured_output)\n",
+                (.permission_denials // [] | .[] | "denied: \(.tool_name) \(.tool_input | tostring | .[0:300])\n")
+              else empty end'
+          result=$(jq -c 'select(.type == "result") | .structured_output // empty' "$OUT")
+          [ -n "$result" ] || { echo "::error::No triage result"; exit 1; }
+          args=()
+          while read -r label; do args+=(--add-label "$label"); done < <(jq -r '
+            .kind, (select(.kind == "bug") | .severity), (select(.duplicate_of) | "duplicate") | values' <<<"$result")
+          gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" "${args[@]}"
+          comment=$(jq -r .comment <<<"$result")
+          if [ -n "$comment" ]; then
+            gh issue comment "$ISSUE" -R "$GITHUB_REPOSITORY" --body "$comment"
+          fi
