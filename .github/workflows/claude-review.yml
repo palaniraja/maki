@@ -28,7 +28,9 @@ jobs:
       REVIEW_EFFORT: ${{ vars.REVIEW_EFFORT || 'high' }}
       SCRATCH_DIR: /tmp/claude-review
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
+      - run: >-
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
+          && sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0
       - run: npm install -g @anthropic-ai/claude-code
       - uses: actions/checkout@v4
         with:
