@@ -22,6 +22,7 @@ jobs:
       TRIAGE_PROMPT: ${{ vars.TRIAGE_PROMPT }}
       TRIAGE_MODEL: ${{ vars.REVIEW_MODEL || 'claude-opus-5-5' }}
       TRIAGE_EFFORT: ${{ vars.REVIEW_EFFORT || 'high' }}
+      TRIAGE_MAX_ISSUES_PER_DAY: ${{ vars.TRIAGE_MAX_ISSUES_PER_DAY || 5 }}
       OUT: /tmp/claude-triage.jsonl
     steps:
       - run: >-
@@ -50,6 +51,15 @@ jobs:
             echo "::error::Set the TRIAGE_PROMPT repository variable"
             exit 1
           fi
+          author=$(gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json author --jq .author.login)
+          if [ "$GITHUB_EVENT_NAME" = issues ]; then
+            since=$(date -u -d '24 hours ago' +%FT%TZ)
+            opened=$(gh api -X GET search/issues -f q="repo:$GITHUB_REPOSITORY is:issue author:$author created:>=$since" --jq .total_count)
+            if [ "$opened" -gt "$TRIAGE_MAX_ISSUES_PER_DAY" ]; then
+              echo "::notice::$author opened $opened issues in 24h (limit $TRIAGE_MAX_ISSUES_PER_DAY), dispatch this workflow to triage anyway"
+              exit 0
+            fi
+          fi
           severities=$(gh label list -R "$GITHUB_REPOSITORY" --search severity --json name,description \
             --jq '[.[] | select(.name | startswith("severity: "))]')
           schema=$(jq -nc --argjson sev "$severities" '{
@@ -62,15 +72,11 @@ jobs:
             },
             required: ["kind", "duplicate_of", "comment"]
           }')
-          issue=$(gh issue view "$ISSUE" -R "$GITHUB_REPOSITORY" --json title,body \
-            --jq '"<title>\(.title)</title>\n<body>\(.body)</body>"')
           prompt="${TRIAGE_PROMPT//\$ISSUE/$ISSUE}"
           prompt="${prompt//\$REPO/$GITHUB_REPOSITORY}"
           prompt="${prompt//\$SHA/$(git rev-parse HEAD)}"
           prompt="${prompt//\$SEVERITIES/$(jq -r '.[] | "  - \(.name): \(.description)"' <<<"$severities")}"
-          claude -p "$prompt
-
-          $issue" \
+          claude -p "$prompt" \
             --model "$TRIAGE_MODEL" \
             --effort "$TRIAGE_EFFORT" \
             --settings '{"attribution":{"commit":"","pr":""},"includeCoAuthoredBy":false,"sandbox":{"network":{"allowedDomains":["github.com","api.github.com"]}}}' \
@@ -95,6 +101,12 @@ jobs:
             .kind, (select(.kind == "bug") | .severity), (select(.duplicate_of) | "duplicate") | values' <<<"$result")
           gh issue edit "$ISSUE" -R "$GITHUB_REPOSITORY" "${args[@]}"
           comment=$(jq -r .comment <<<"$result")
-          if [ -n "$comment" ]; then
+          blocked=$(jq -r --arg repo "$GITHUB_REPOSITORY" --arg owner "$GITHUB_REPOSITORY_OWNER" --arg author "$author" '
+            .comment | gsub("```[\\s\\S]*?```"; "") | gsub("`[^`]*`"; "")
+            | (scan("https?://[^\\s)\\]>\"]+") | select(startswith("https://maki.sh/") or startswith("https://github.com/\($repo)/") | not)),
+              (scan("(?<![\\w/])@[\\w-]+") | select(. != "@\($owner)" and . != "@\($author)"))' <<<"$result")
+          if [ -n "$blocked" ]; then
+            echo "::warning::Comment not posted, it links or mentions outside the allowlist: $(paste -sd ' ' <<<"$blocked")"
+          elif [ -n "$comment" ]; then
             gh issue comment "$ISSUE" -R "$GITHUB_REPOSITORY" --body "$comment"
           fi
